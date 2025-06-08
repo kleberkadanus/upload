@@ -1,0 +1,63 @@
+version: '3'
+
+services:
+  whatsapp-bot:
+    image: kasbysuporttech/whatsapp-bot:latest
+    container_name: whatsapp-bot
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - whatsapp_data:/usr/src/app/.wwebjs_auth
+      - whatsapp_uploads:/usr/src/app/uploads
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASSWORD=whatsapp_bot_password
+      - DB_NAME=whatsapp_bot_db
+    depends_on:
+      - db
+    networks:
+      - whatsapp-network
+
+  dashboard:
+    image: kasbysuporttech/whatsapp-dashboard:latest
+    container_name: whatsapp-dashboard
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASSWORD=whatsapp_bot_password
+      - DB_NAME=whatsapp_bot_db
+    depends_on:
+      - db
+      - whatsapp-bot
+    networks:
+      - whatsapp-network
+
+  db:
+    image: mariadb:10.5
+    container_name: whatsapp-db
+    restart: always
+    ports:
+      - "3307:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=whatsapp_bot_password
+      - MYSQL_DATABASE=whatsapp_bot_db
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - whatsapp-network
+
+volumes:
+  whatsapp_data:
+  whatsapp_uploads:
+  db_data:
+
+networks:
+  whatsapp-network:
+    driver: bridge

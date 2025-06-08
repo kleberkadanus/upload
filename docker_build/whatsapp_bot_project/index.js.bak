@@ -1,0 +1,933 @@
+
+const qrcodeTerminal = require("qrcode-terminal");
+const qrcode = require("qrcode");
+const fs = require("fs");
+const { Client, LocalAuth, MessageMedia, List, Buttons } = require("whatsapp-web.js");
+const mariadb = require("mariadb");
+const { google } = require("googleapis");
+const path = require("path");
+const { Client: GoogleMapsClient } = require('@googlemaps/google-maps-services-js');
+
+// --- Database Configuration ---
+const pool = mariadb.createPool({
+  host: "104.234.30.102",
+  user: "root",
+  password: "+0q)3E3.G]Yu",
+  database: "WTS2",
+  connectionLimit: 5,
+  connectTimeout: 15000,
+  acquireTimeout: 15000,
+});
+
+// --- Google Calendar Configuration ---
+const CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"];
+const SERVICE_ACCOUNT_KEY_PATH = path.join(__dirname, "service_account.json");
+const CALENDAR_ID = "kleberkadanus94@gmail.com"; // Agenda principal do usuário
+
+const googleAuth = new google.auth.GoogleAuth({
+  keyFile: SERVICE_ACCOUNT_KEY_PATH,
+  scopes: CALENDAR_SCOPES,
+});
+
+const calendar = google.calendar({ version: "v3", auth: googleAuth });
+
+// --- WhatsApp Client Setup ---
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  },
+});
+
+// Store conversation state for each user { senderId: { state: ..., data: {} } }
+const userState = {};
+const QR_FILE_PATH = "/home/ubuntu/whatsapp_bot_project/qrcode.png";
+
+client.on("qr", (qr) => {
+  console.log("[EVENTO QR] QR Code recebido. Tentando salvar como imagem...");
+  qrcode.toFile(QR_FILE_PATH, qr, { errorCorrectionLevel: "H" }, function (err) {
+    if (err) {
+      console.error("[ERRO QR] Erro ao salvar QR code como imagem:", err);
+      console.log(
+        "[QR ALTERNATIVO] Exibindo QR code no terminal (pode ser grande):"
+      );
+      qrcodeTerminal.generate(qr, { small: true });
+    } else {
+      console.log(`[QR SALVO] QR Code salvo como imagem em: ${QR_FILE_PATH}`);
+      console.log(
+        "[AÇÃO NECESSÁRIA] Peça ao seu assistente (Manus) para enviar o arquivo qrcode.png para você."
+      );
+    }
+  });
+});
+
+client.on("ready", () => {
+  console.log("[EVENTO READY] Cliente WhatsApp está pronto!");
+  if (fs.existsSync(QR_FILE_PATH)) {
+    try {
+        fs.unlinkSync(QR_FILE_PATH);
+        console.log(`[INFO] Arquivo QR code (${QR_FILE_PATH}) removido após conexão.`);
+    } catch (unlinkErr) {
+        console.error(`[ERRO] Falha ao remover arquivo QR code: ${unlinkErr.message}`);
+    }
+  }
+});
+
+client.on("auth_failure", (msg) => {
+  console.error("[EVENTO AUTH_FAILURE] Falha na autenticação:", msg);
+});
+
+client.on("disconnected", (reason) => {
+  console.log("[EVENTO DISCONNECTED] Cliente foi desconectado:", reason);
+});
+
+// --- Message Handling Logic ---
+client.on("message", async (msg) => {
+  const chat = await msg.getChat();
+  const contact = await msg.getContact();
+  const senderNumber = contact.id.user;
+  const senderId = contact.id._serialized;
+
+  console.log(
+    `[MSG RECEBIDA] De: ${senderNumber} (${contact.pushname || "N/A"}) | Chat: ${chat.id.user} | Tipo: ${msg.type} | Corpo: ${msg.body}`
+  );
+
+  if (chat.isGroup || msg.isStatus) {
+    console.log("[INFO] Ignorando msg de grupo/status.");
+    return;
+  }
+  
+  // Verificar se é um comando de atendente
+  if (msg.body.startsWith('/')) {
+    const commandParts = msg.body.split(' ');
+    const command = commandParts[0].toLowerCase();
+    const params = commandParts.slice(1).join(' ');
+    
+    // Verificar se o remetente é um atendente
+    let conn = await pool.getConnection();
+    try {
+      const isAttendant = await conn.query(
+        "SELECT id, name FROM attendants WHERE whatsapp_number = ?",
+        [senderNumber]
+      );
+      
+      if (isAttendant.length > 0) {
+        const attendantId = isAttendant[0].id;
+        const attendantName = isAttendant[0].name;
+        
+        // Atualizar status do atendente para disponível
+        await conn.query(
+          "UPDATE attendants SET status = 'available', last_activity = NOW() WHERE id = ?",
+          [attendantId]
+        );
+        
+        // Processar comandos de atendente
+        switch (command) {
+          case '/finalizar':
+            // Verificar se o atendente tem algum atendimento em andamento
+            const activeTickets = await conn.query(
+              "SELECT sq.id, sq.whatsapp_number, c.name, c.id as client_id FROM support_queue sq JOIN clients c ON sq.client_id = c.id WHERE sq.assigned_to = ? AND sq.status = 'in_progress'",
+              [attendantId]
+            );
+            
+            if (activeTickets.length === 0) {
+              await client.sendMessage(senderId, "Você não possui nenhum atendimento em andamento para finalizar.");
+              break;
+            }
+            
+            // Finalizar todos os atendimentos ativos deste atendente
+            for (const ticket of activeTickets) {
+              await conn.query(
+                "UPDATE support_queue SET status = 'completed' WHERE id = ?",
+                [ticket.id]
+              );
+              
+              // Notificar cliente que o atendimento foi finalizado
+              const clientId = `${ticket.whatsapp_number}@c.us`;
+              await client.sendMessage(
+                clientId,
+                `Seu atendimento com ${attendantName} foi finalizado. Agradecemos o contato!\n\nComo você avalia o atendimento recebido? (Digite um número de 1 a 5 estrelas)`
+              );
+              
+              // Configurar estado do cliente para avaliação
+              if (!userState[clientId]) {
+                userState[clientId] = { state: "awaiting_rating", data: {} };
+              } else {
+                userState[clientId].state = "awaiting_rating";
+              }
+              userState[clientId].data = {
+                clientId: ticket.client_id,
+                reviewType: "attendant_support",
+                attendantId: attendantId
+              };
+            }
+            
+            // Verificar se há clientes na fila de espera
+            const waitingClients = await conn.query(
+              "SELECT sq.id, sq.whatsapp_number, c.id as client_id, c.name FROM support_queue sq JOIN clients c ON sq.client_id = c.id WHERE sq.status = 'waiting' ORDER BY sq.created_at ASC LIMIT 1"
+            );
+            
+            if (waitingClients.length > 0) {
+              const nextClient = waitingClients[0];
+              
+              // Atribuir próximo cliente da fila para este atendente
+              await conn.query(
+                "UPDATE support_queue SET status = 'in_progress', assigned_to = ? WHERE id = ?",
+                [attendantId, nextClient.id]
+              );
+              
+              // Notificar atendente sobre o próximo cliente
+              const clientInfo = `Nome: ${nextClient.name}\nTelefone: ${nextClient.whatsapp_number}`;
+              await client.sendMessage(
+                senderId,
+                `✅ Atendimento(s) anterior(es) finalizado(s).\n\n🔔 *Próximo Cliente na Fila*\n\n${clientInfo}\n\nPara iniciar a conversa, use o comando:\n/falarcom ${nextClient.whatsapp_number}`
+              );
+              
+              // Notificar cliente que será atendido
+              const nextClientId = `${nextClient.whatsapp_number}@c.us`;
+              await client.sendMessage(
+                nextClientId,
+                `Olá! O atendente ${attendantName} está disponível e irá atendê-lo em instantes.`
+              );
+            } else {
+              // Não há mais clientes na fila
+              await client.sendMessage(
+                senderId,
+                "✅ Atendimento(s) finalizado(s). Não há mais clientes na fila de espera."
+              );
+              
+              // Atualizar status do atendente para disponível
+              await conn.query(
+                "UPDATE attendants SET status = 'available' WHERE id = ?",
+                [attendantId]
+              );
+            }
+            break;
+            
+          case '/falarcom':
+            if (!params) {
+              await client.sendMessage(senderId, "Por favor, forneça o número do cliente. Exemplo: /falarcom 5541999999999");
+              break;
+            }
+            
+            const clientNumber = params.trim();
+            const clientId = `${clientNumber}@c.us`;
+            
+            // Verificar se o cliente existe no banco
+            const clientExists = await conn.query(
+              "SELECT id, name FROM clients WHERE whatsapp_number = ?",
+              [clientNumber]
+            );
+            
+            if (clientExists.length === 0) {
+              await client.sendMessage(senderId, `Cliente com número ${clientNumber} não encontrado no sistema.`);
+              break;
+            }
+            
+            // Verificar se já existe um atendimento em andamento para este cliente
+            const existingTicket = await conn.query(
+              "SELECT id, assigned_to FROM support_queue WHERE whatsapp_number = ? AND status = 'in_progress'",
+              [clientNumber]
+            );
+            
+            if (existingTicket.length > 0 && existingTicket[0].assigned_to !== attendantId) {
+              // Cliente já está sendo atendido por outro atendente
+              const otherAttendant = await conn.query(
+                "SELECT name FROM attendants WHERE id = ?",
+                [existingTicket[0].assigned_to]
+              );
+              
+              const attendantName = otherAttendant.length > 0 ? otherAttendant[0].name : "outro atendente";
+              await client.sendMessage(senderId, `Este cliente já está sendo atendido por ${attendantName}.`);
+              break;
+            }
+            
+            // Atualizar ou criar ticket de atendimento
+            if (existingTicket.length > 0) {
+              // Já existe um ticket para este cliente com este atendente
+              await client.sendMessage(senderId, `Você já está em atendimento com ${clientExists[0].name}. Continue a conversa normalmente.`);
+            } else {
+              // Criar novo ticket ou atualizar ticket existente na fila
+              const waitingTicket = await conn.query(
+                "SELECT id FROM support_queue WHERE whatsapp_number = ? AND status = 'waiting'",
+                [clientNumber]
+              );
+              
+              if (waitingTicket.length > 0) {
+                // Atualizar ticket existente
+                await conn.query(
+                  "UPDATE support_queue SET status = 'in_progress', assigned_to = ? WHERE id = ?",
+                  [attendantId, waitingTicket[0].id]
+                );
+              } else {
+                // Criar novo ticket
+                await conn.query(
+                  "INSERT INTO support_queue (client_id, whatsapp_number, status, assigned_to) VALUES (?, ?, 'in_progress', ?)",
+                  [clientExists[0].id, clientNumber, attendantId]
+                );
+              }
+              
+              // Atualizar status do atendente para ocupado
+              await conn.query(
+                "UPDATE attendants SET status = 'busy' WHERE id = ?",
+                [attendantId]
+              );
+              
+              // Notificar cliente
+              await client.sendMessage(
+                clientId,
+                `Olá! Sou ${attendantName}, atendente da empresa, e estou aqui para ajudá-lo. Como posso ser útil hoje?`
+              );
+              
+              await client.sendMessage(
+                senderId,
+                `✅ Atendimento iniciado com ${clientExists[0].name} (${clientNumber}).\nTodas as suas mensagens serão encaminhadas para o cliente até que você use o comando /finalizar.`
+              );
+            }
+            break;
+            
+          case '/enviarpix':
+            if (!params) {
+              await client.sendMessage(senderId, "Por favor, forneça o número do cliente. Exemplo: /enviarpix 5541999999999");
+              break;
+            }
+            
+            const pixClientNumber = params.trim();
+            const pixClientId = `${pixClientNumber}@c.us`;
+            
+            // Buscar chave PIX no banco de dados
+            const pixConfig = await conn.query("SELECT value FROM config WHERE name = 'pix_key'");
+            
+            if (pixConfig.length === 0 || !pixConfig[0].value) {
+              await client.sendMessage(senderId, "Chave PIX não configurada no sistema.");
+              break;
+            }
+            
+            const pixKey = pixConfig[0].value;
+            
+            // Enviar chave PIX para o cliente
+            await client.sendMessage(
+              pixClientId,
+              `*Chave PIX para Pagamento*\n\nSegue nossa chave PIX para pagamento:\n\n${pixKey}\n\nApós realizar o pagamento, por favor envie o comprovante para confirmarmos.`
+            );
+            
+            await client.sendMessage(
+              senderId,
+              `✅ Chave PIX enviada com sucesso para o cliente ${pixClientNumber}.`
+            );
+            break;
+            
+          case '/enviarboleto':
+            if (!params) {
+              await client.sendMessage(senderId, "Por favor, forneça o número do cliente. Exemplo: /enviarboleto 5541999999999");
+              break;
+            }
+            
+            const boletoClientNumber = params.trim();
+            const boletoClientId = `${boletoClientNumber}@c.us`;
+            
+            // Verificar se o cliente existe
+            const boletoClient = await conn.query(
+              "SELECT id, name FROM clients WHERE whatsapp_number = ?",
+              [boletoClientNumber]
+            );
+            
+            if (boletoClient.length === 0) {
+              await client.sendMessage(senderId, `Cliente com número ${boletoClientNumber} não encontrado no sistema.`);
+              break;
+            }
+            
+            // Buscar boletos do cliente
+            const boletos = await conn.query(
+              "SELECT id, reference, due_date, amount, pdf_url FROM boletos WHERE client_id = ? ORDER BY due_date DESC",
+              [boletoClient[0].id]
+            );
+            
+            if (boletos.length === 0) {
+              await client.sendMessage(senderId, `Não foram encontrados boletos para o cliente ${boletoClient[0].name}.`);
+              break;
+            }
+            
+            // Enviar o boleto mais recente
+            const latestBoleto = boletos[0];
+            const dueDate = new Date(latestBoleto.due_date).toLocaleDateString('pt-BR');
+            
+            await client.sendMessage(
+              boletoClientId,
+              `*Segunda via de boleto*\n\nSegue a segunda via do seu boleto:\n\nReferência: ${latestBoleto.reference}\nVencimento: ${dueDate}\nValor: R$ ${latestBoleto.amount.toFixed(2)}\n\nO boleto será enviado em seguida.`
+            );
+            
+            // Enviar PDF do boleto
+            if (latestBoleto.pdf_url) {
+              try {
+                const media = await MessageMedia.fromUrl(latestBoleto.pdf_url);
+                await client.sendMessage(boletoClientId, media, {
+                  caption: `Boleto - Vencimento: ${dueDate}`
+                });
+                
+                await client.sendMessage(
+                  senderId,
+                  `✅ Boleto enviado com sucesso para o cliente ${boletoClient[0].name}.`
+                );
+              } catch (error) {
+                console.error("[ERRO] Falha ao enviar PDF do boleto:", error);
+                await client.sendMessage(
+                  senderId,
+                  `❌ Erro ao enviar PDF do boleto. URL inválida ou inacessível: ${latestBoleto.pdf_url}`
+                );
+              }
+            } else {
+              await client.sendMessage(
+                senderId,
+                `⚠️ O boleto não possui URL do PDF cadastrada no sistema.`
+              );
+            }
+            break;
+            
+          default:
+            await client.sendMessage(
+              senderId,
+              "Comando de atendente não reconhecido. Use /finalizar, /falarcom [numero], /enviarpix [numero] ou /enviarboleto [numero]."
+            );
+        }
+        conn.release();
+        return; // Sai do fluxo normal, pois é um comando de atendente
+      }
+      
+      // Se não for atendente, verificar se é técnico
+      const technicianModule = require('./technician_module.js');
+      const isTechnicianCommand = await technicianModule.processTechnicianCommand(client, conn, senderId, senderNumber, command, params);
+      if (isTechnicianCommand) {
+        conn.release();
+        return; // Sai do fluxo normal, pois é um comando de técnico
+      }
+      
+    } catch (error) {
+      console.error('[ERRO DB] Erro ao processar comando de atendente/técnico:', error);
+      await client.sendMessage(senderId, "Ocorreu um erro ao processar seu comando. Tente novamente mais tarde.");
+      if (conn) conn.release();
+      return;
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+
+  // Processar botões de técnico
+  if (msg.selectedButtonId) {
+    let conn = await pool.getConnection();
+    try {
+      const technicianModule = require('./technician_module.js');
+      const isTechnicianButton = await technicianModule.processTechnicianButton(client, conn, senderId, senderNumber, msg, userState);
+      if (isTechnicianButton) {
+        conn.release();
+        return; // Sai do fluxo normal, pois é um botão de técnico
+      }
+    } catch (error) {
+      console.error('[ERRO DB] Erro ao processar botão de técnico:', error);
+      await client.sendMessage(senderId, "Ocorreu um erro ao processar sua ação. Tente novamente mais tarde.");
+      if (conn) conn.release();
+      return;
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+
+  // Processar estados de técnico
+  const stateInfo = userState[senderId];
+  if (stateInfo && stateInfo.state && stateInfo.state.startsWith('awaiting_technician')) { // Exemplo de prefixo para estados de técnico
+    let conn = await pool.getConnection();
+    try {
+      const technicianModule = require('./technician_module.js');
+      const isTechnicianState = await technicianModule.processTechnicianState(client, conn, senderId, senderNumber, msg, stateInfo);
+      if (isTechnicianState) {
+        conn.release();
+        return; // Sai do fluxo normal, pois é um estado de técnico
+      }
+    } catch (error) {
+      console.error('[ERRO DB] Erro ao processar estado de técnico:', error);
+      await client.sendMessage(senderId, "Ocorreu um erro ao processar sua solicitação. Tente novamente mais tarde.");
+      if (conn) conn.release();
+      return;
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+
+  // --- Lógica de Cliente Normal ---
+  let conn = await pool.getConnection();
+  let currentClient = null;
+  try {
+    const clientResult = await conn.query(
+      "SELECT id, name, address, last_interaction_type FROM clients WHERE whatsapp_number = ? LIMIT 1",
+      [senderNumber]
+    );
+    if (clientResult.length > 0) {
+      currentClient = clientResult[0];
+      console.log(`[DB] Cliente encontrado: ${currentClient.name}`);
+    } else {
+      console.log("[DB] Cliente não encontrado, iniciando cadastro.");
+    }
+  } catch (dbError) {
+    console.error("[ERRO DB] Falha ao buscar cliente:", dbError);
+    await client.sendMessage(
+      senderId,
+      "Desculpe, estou com problemas para acessar nosso sistema no momento. Por favor, tente novamente em alguns instantes."
+    );
+    if (conn) conn.release();
+    return;
+  }
+
+  if (!userState[senderId]) {
+    if (!currentClient) {
+      userState[senderId] = { state: "awaiting_name", data: {} };
+      console.log(`[ESTADO] Novo estado: awaiting_name para ${senderId}`);
+      await client.sendMessage(
+        senderId,
+        "Olá! Sou o assistente virtual da Kadan Tech. Para começarmos, qual é o seu nome?"
+      );
+    } else {
+      // Cliente já cadastrado, verificar última interação
+      if (currentClient.last_interaction_type && currentClient.last_interaction_type !== "Avaliação") {
+        userState[senderId] = {
+          state: "awaiting_repeat_or_menu",
+          data: { lastInteraction: currentClient.last_interaction_type },
+        };
+        console.log(`[ESTADO] Novo estado: awaiting_repeat_or_menu para ${senderId}`);
+        await client.sendMessage(
+          senderId,
+          `Olá ${currentClient.name}, bem-vindo(a) de volta! Sua última interação foi sobre: *${currentClient.last_interaction_type}*.\n\n1. Repetir esta ação\n2. Ver menu principal`
+        );
+      } else {
+        await showMainMenu(senderId, currentClient.name);
+      }
+    }
+  } else {
+    // Processar estado atual do cliente
+    const stateInfo = userState[senderId];
+    console.log(`[ESTADO] Processando estado ${stateInfo.state} para ${senderId}`);
+
+    switch (stateInfo.state) {
+      case "awaiting_name":
+        const name = msg.body.trim();
+        if (name.length < 2) {
+          await client.sendMessage(senderId, "Por favor, digite um nome válido.");
+          break;
+        }
+        stateInfo.data.name = name;
+        stateInfo.state = "awaiting_address";
+        console.log(`[DADO] Nome recebido: ${name}`);
+        console.log(`[ESTADO] Estado atualizado para awaiting_address para ${senderId}`);
+        await client.sendMessage(
+          senderId,
+          `Obrigado, ${name}! Agora, por favor, me informe seu endereço completo (Rua, Número, Bairro, Cidade).`
+        );
+        break;
+
+      case "awaiting_address":
+        const address = msg.body.trim();
+        if (address.length < 5) {
+          await client.sendMessage(senderId, "Por favor, digite um endereço válido.");
+          break;
+        }
+        stateInfo.data.address = address;
+        console.log(`[DADO] Endereço recebido: ${address}`);
+        try {
+          const insertResult = await conn.query(
+            "INSERT INTO clients (name, whatsapp_number, address) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), address = VALUES(address)",
+            [stateInfo.data.name, senderNumber, stateInfo.data.address]
+          );
+          currentClient = { id: insertResult.insertId, name: stateInfo.data.name, address: stateInfo.data.address }; // Atualiza currentClient
+          console.log(
+            `[DB] Cliente ${stateInfo.data.name} (ID: ${insertResult.insertId}) salvo/atualizado com sucesso.`
+          );
+          await showMainMenu(senderId, stateInfo.data.name);
+        } catch (dbError) {
+          console.error("[ERRO DB] Falha ao salvar cliente:", dbError);
+          await client.sendMessage(
+            senderId,
+            "Desculpe, não consegui salvar seus dados agora. Tente novamente mais tarde."
+          );
+          delete userState[senderId];
+        }
+        break;
+
+      case "awaiting_menu_choice":
+        const choice = msg.body.trim();
+        let nextState = null;
+        let responseMessage = "";
+        let interactionType = ""; // Para salvar no ticket
+
+        switch (choice) {
+          case "1": // Financeiro
+            interactionType = "Financeiro";
+            nextState = "awaiting_finance_choice";
+            responseMessage =
+              "Você escolheu Financeiro. O que você gostaria de fazer?\n\n1. Consultar Chave PIX\n2. Consultar Boletos Pendentes";
+            break;
+          case "2": // Agendamento
+            interactionType = "Agendamento";
+            nextState = "awaiting_specialty";
+            // TODO: Buscar especialidades do banco ou de uma config
+            const specialtiesList = ["Manutenção Preventiva", "Reparo Urgente", "Instalação", "Outro"];
+            let specialtyMenu = "Você escolheu Agendamento. Qual serviço você precisa?\n\n";
+            specialtiesList.forEach((spec, index) => {
+                specialtyMenu += `${index + 1}. ${spec}\n`;
+            });
+            responseMessage = specialtyMenu;
+            break;
+          case "3": // Dúvidas / Falar com Atendente
+            interactionType = "Suporte Atendente";
+            // Lógica de fila de atendimento
+            try {
+                // Verificar se já existe um ticket aberto para este cliente
+                const existingTicket = await conn.query(
+                    "SELECT id, status FROM support_queue WHERE client_id = ? AND status IN ('waiting', 'in_progress')", 
+                    [currentClient.id]
+                );
+
+                if (existingTicket.length > 0) {
+                    if (existingTicket[0].status === 'waiting') {
+                        const queuePosition = await conn.query(
+                            "SELECT COUNT(*) as position FROM support_queue WHERE status = 'waiting' AND created_at <= (SELECT created_at FROM support_queue WHERE id = ?)",
+                            [existingTicket[0].id]
+                        );
+                        responseMessage = `Você já está na fila de atendimento. Sua posição atual é: ${queuePosition[0].position}. Por favor, aguarde.`;
+                    } else {
+                        responseMessage = "Você já está sendo atendido. Por favor, aguarde a resposta do atendente.";
+                    }
+                } else {
+                    // Inserir cliente na fila
+                    await conn.query(
+                        "INSERT INTO support_queue (client_id, whatsapp_number, status) VALUES (?, ?, 'waiting')",
+                        [currentClient.id, senderNumber]
+                    );
+                    
+                    // Notificar atendentes disponíveis
+                    const availableAttendants = await conn.query(
+                        "SELECT whatsapp_number FROM attendants WHERE status = 'available'"
+                    );
+                    
+                    if (availableAttendants.length > 0) {
+                        for (const attendant of availableAttendants) {
+                            const attendantId = `${attendant.whatsapp_number}@c.us`;
+                            await client.sendMessage(attendantId, `🔔 Novo cliente na fila de atendimento: ${currentClient.name} (${senderNumber}). Use /falarcom ${senderNumber} para atender.`);
+                        }
+                        responseMessage = "Você escolheu Dúvidas / Falar com Atendente. Você foi adicionado à fila e um atendente irá contatá-lo em breve.";
+                    } else {
+                        responseMessage = "Você escolheu Dúvidas / Falar com Atendente. No momento, todos os nossos atendentes estão ocupados. Por favor, aguarde e você será atendido assim que possível.";
+                    }
+                }
+            } catch (dbError) {
+              console.error("[ERRO DB] Falha ao processar fila de atendimento:", dbError);
+              responseMessage = "Você escolheu Dúvidas / Falar com Atendente. Ocorreu um erro ao processar seu pedido. Por favor, tente novamente mais tarde.";
+            }
+            
+            await client.sendMessage(senderId, responseMessage);
+            return; // Sai do fluxo normal
+          case "4": // Info Serviços
+            interactionType = "Info Serviços";
+            responseMessage = "Você escolheu Informações sobre Serviços. Nossos principais serviços são: Manutenção Preventiva, Reparos Urgentes e Instalações. Para mais detalhes, por favor, selecione a opção de agendamento ou fale com um atendente.";
+            // Apenas informa, não muda estado, finaliza interação
+            await client.sendMessage(senderId, responseMessage);
+            await showThankYouAndRating(senderId, currentClient ? currentClient.id : null, interactionType);
+            return; // Sai do fluxo normal
+          case "5": // Cancelar Agendamento
+            interactionType = "Cancelamento";
+            nextState = "awaiting_cancel_confirmation";
+            // Buscar agendamentos ativos do cliente
+            try {
+              const activeAppointments = await conn.query(
+                "SELECT a.id, a.specialty, a.scheduled_datetime, a.period, a.google_calendar_event_id FROM appointments a WHERE a.client_id = ? AND a.status = 'scheduled' AND a.scheduled_datetime > NOW() ORDER BY a.scheduled_datetime ASC",
+                [currentClient.id]
+              );
+              
+              if (activeAppointments.length === 0) {
+                await client.sendMessage(senderId, "Você não possui agendamentos ativos para cancelar.");
+                await showMainMenu(senderId, currentClient.name);
+                return;
+              }
+              
+              // Armazenar os agendamentos no estado para uso posterior
+              stateInfo.data.activeAppointments = activeAppointments;
+              
+              // Mostrar lista de agendamentos para cancelar
+              let appointmentList = "Agendamentos ativos:\n\n";
+              activeAppointments.forEach((apt, index) => {
+                const aptDate = new Date(apt.scheduled_datetime);
+                appointmentList += `${index + 1}. ${apt.specialty} - ${aptDate.toLocaleDateString('pt-BR')} (${apt.period})\n`;
+              });
+              appointmentList += "\nDigite o número do agendamento que deseja cancelar:";
+              
+              responseMessage = appointmentList;
+            } catch (dbError) {
+              console.error("[ERRO DB] Falha ao buscar agendamentos ativos:", dbError);
+              await client.sendMessage(senderId, "Desculpe, não consegui verificar seus agendamentos agora. Tente novamente mais tarde.");
+              await showMainMenu(senderId, currentClient.name);
+              return;
+            }
+            break;
+          case "admin": // Comando administrativo para lembretes
+            // Verificar se o número é de um administrador
+            try {
+              const isAdmin = await conn.query(
+                "SELECT 1 FROM admin_users WHERE whatsapp_number = ?",
+                [senderNumber]
+              );
+              
+              if (isAdmin.length === 0) {
+                await client.sendMessage(senderId, "Você não tem permissão para acessar comandos administrativos.");
+                await showMainMenu(senderId, currentClient.name);
+                return;
+              }
+              
+              // Mostrar menu administrativo
+              const adminMenu = 
+                "🔧 *Menu Administrativo*\n\n" +
+                "1. Enviar lembretes para agendamentos de amanhã\n" +
+                "2. Voltar ao menu principal\n\n" +
+                "Digite o número da opção desejada:";
+              
+              stateInfo.state = "awaiting_admin_choice";
+              await client.sendMessage(senderId, adminMenu);
+              return;
+            } catch (dbError) {
+              console.error("[ERRO DB] Falha ao verificar permissões de administrador:", dbError);
+              await client.sendMessage(senderId, "Desculpe, ocorreu um erro ao processar seu comando. Tente novamente mais tarde.");
+              await showMainMenu(senderId, currentClient.name);
+              return;
+            }
+            break;
+            
+          default:
+            await client.sendMessage(
+              senderId,
+              "Opção inválida. Por favor, digite o número de uma das opções do menu."
+            );
+            await showMainMenu(senderId, currentClient ? currentClient.name : "Cliente");
+            return;
+        }
+
+        // Save interaction type to a new ticket
+        if (interactionType && currentClient && currentClient.id) {
+           try {
+              await conn.query(
+                  "INSERT INTO tickets (client_id, last_interaction_type, status) VALUES (?, ?, ?)",
+                  [currentClient.id, interactionType, "open"]
+              );
+              console.log(`[DB] Novo ticket criado para cliente ${currentClient.id} com interação ${interactionType}`);
+           } catch (ticketError) {
+              console.error("[ERRO DB] Erro ao criar ticket: ", ticketError);
+           }
+        }
+
+        // Update state and send next message
+        if (nextState) {
+          userState[senderId] = { ...stateInfo, state: nextState };
+          console.log(`[ESTADO] Estado atualizado para ${nextState} para ${senderId}`);
+          await client.sendMessage(senderId, responseMessage);
+        } else {
+          // Should not happen for valid choices handled above, but as fallback:
+          console.warn(`[AVISO] nextState não definido para escolha ${choice}, finalizando fluxo.`);
+          await showThankYouAndRating(senderId, currentClient ? currentClient.id : null, interactionType);
+        }
+        break;
+
+      case "awaiting_finance_choice":
+          const financeChoice = msg.body.trim();
+          console.log(`[DADO] Opção Financeiro: ${financeChoice}`);
+          if (financeChoice === "1") { // Consultar PIX
+              let pixKey = "Chave PIX não configurada.";
+              try {
+                  const settingResult = await conn.query("SELECT setting_value FROM settings WHERE setting_key = ?", ["pix_key"]);
+                  if (settingResult.length > 0) pixKey = settingResult[0].setting_value;
+              } catch (e) { console.error("[ERRO DB] Erro ao buscar chave PIX", e); }
+              await client.sendMessage(senderId, `Nossa chave PIX é: ${pixKey}`);
+              await showThankYouAndRating(senderId, currentClient?.id, "Consulta PIX");
+          } else if (financeChoice === "2") { // Consultar Boleto
+              try {
+                  const invoices = await conn.query("SELECT id, description, due_date, amount, pdf_url FROM invoices WHERE client_id = ? AND status = ? ORDER BY due_date ASC", [currentClient.id, "pending"]);
+                  if (invoices.length === 0) {
+                      await client.sendMessage(senderId, "Você não possui boletos pendentes no momento.");
+                      await showThankYouAndRating(senderId, currentClient?.id, "Consulta Boleto (Nenhum)");
+                  } else {
+                      let invoiceList = "Boletos pendentes:\n";
+                      invoices.forEach((inv, index) => {
+                          invoiceList += `\n${index + 1}. ${inv.description} (Venc: ${new Date(inv.due_date).toLocaleDateString("pt-BR")}, R$ ${inv.amount.toFixed(2)})`;
+                      });
+                      invoiceList += "\n\nDigite o número do boleto que deseja receber:";
+                      userState[senderId] = { ...stateInfo, state: "awaiting_invoice_choice", data: { ...stateInfo.data, invoices: invoices } };
+                      console.log(`[ESTADO] Estado atualizado para awaiting_invoice_choice para ${senderId}`);
+                      await client.sendMessage(senderId, invoiceList);
+                  }
+              } catch (dbErr) {
+                  console.error("[ERRO DB] Erro ao buscar boletos:", dbErr);
+                  await client.sendMessage(senderId, "Desculpe, não consegui consultar seus boletos agora. Tente novamente mais tarde.");
+                  delete userState[senderId];
+              }
+          } else {
+              await client.sendMessage(senderId, "Opção inválida. Por favor, digite 1 para PIX ou 2 para Boletos.");
+          }
+          break;
+
+      case "awaiting_invoice_choice":
+          const invoiceIndex = parseInt(msg.body.trim()) - 1;
+          const userInvoices = stateInfo.data.invoices;
+          if (userInvoices && invoiceIndex >= 0 && invoiceIndex < userInvoices.length) {
+              const selectedInvoice = userInvoices[invoiceIndex];
+              console.log(`[DADO] Boleto selecionado: ID ${selectedInvoice.id}`);
+              if (selectedInvoice.pdf_url) {
+                  try {
+                      const media = await MessageMedia.fromUrl(selectedInvoice.pdf_url, { unsafeMime: true }); // unsafeMime pode ser necessário dependendo da URL
+                      await client.sendMessage(senderId, `Aqui está o boleto para ${selectedInvoice.description}:`, { media: media });
+                      console.log(`[INFO] PDF do boleto ${selectedInvoice.id} enviado para ${senderId}`);
+                      await showThankYouAndRating(senderId, currentClient?.id, "Envio Boleto PDF");
+                  } catch (mediaError) {
+                      console.error(`[ERRO MÍDIA] Falha ao buscar/enviar PDF do boleto ${selectedInvoice.id} da URL ${selectedInvoice.pdf_url}:`, mediaError);
+                      await client.sendMessage(senderId, `Desculpe, não consegui obter o PDF do boleto (${selectedInvoice.description}) no momento. Por favor, entre em contato com o suporte.`);
+                      await showThankYouAndRating(senderId, currentClient?.id, "Envio Boleto PDF (Erro)");
+                  }
+              } else {
+                  await client.sendMessage(senderId, `O boleto selecionado (${selectedInvoice.description}) não possui um arquivo PDF disponível para envio automático. Por favor, entre em contato com o suporte.`);
+                  console.log(`[INFO] Boleto ${selectedInvoice.id} sem PDF para ${senderId}`);
+                  await showThankYouAndRating(senderId, currentClient?.id, "Envio Boleto (Sem PDF)");
+              }
+          } else {
+              await client.sendMessage(senderId, "Número de boleto inválido. Por favor, digite o número correspondente ao boleto desejado da lista anterior.");
+          }
+          break;
+
+      case "awaiting_repeat_or_menu":
+          const repeatChoice = msg.body.trim();
+          console.log(`[DADO] Resposta para repetir/menu: ${repeatChoice}`);
+          if (repeatChoice === "1") {
+              // TODO: Implementar lógica para repetir a última ação
+              await client.sendMessage(senderId, `Ok, vamos repetir a ação: \"${stateInfo.data.lastInteraction}\". (Funcionalidade ainda em desenvolvimento)`);
+              delete userState[senderId];
+              console.log(`[ESTADO] Estado removido para ${senderId} após escolher repetir.`);
+          } else if (repeatChoice === "2") {
+              await showMainMenu(senderId, currentClient ? currentClient.name : "Cliente");
+          } else {
+              await client.sendMessage(senderId, "Opção inválida. Por favor, digite 1 para repetir ou 2 para ver o menu.");
+          }
+          break;
+
+      // --- Novos Estados para Agendamento ---
+      case "awaiting_specialty":
+          const specialtyChoiceIndex = parseInt(msg.body.trim()) - 1;
+          // TODO: Usar a mesma lista de especialidades definida anteriormente
+          const specialtiesList = ["Manutenção Preventiva", "Reparo Urgente", "Instalação", "Outro"];
+          if (specialtyChoiceIndex >= 0 && specialtyChoiceIndex < specialtiesList.length) {
+              const chosenSpecialty = specialtiesList[specialtyChoiceIndex];
+              stateInfo.data.specialty = chosenSpecialty;
+              stateInfo.state = "awaiting_problem_description";
+              console.log(`[DADO] Especialidade escolhida: ${chosenSpecialty}`);
+              console.log(`[ESTADO] Estado atualizado para awaiting_problem_description para ${senderId}`);
+              await client.sendMessage(senderId, `Entendido: ${chosenSpecialty}.\n\nAgora, por favor, descreva o problema ou o serviço que você precisa. Se possível, envie fotos para ajudar no diagnóstico.`);
+          } else {
+              await client.sendMessage(senderId, "Opção de especialidade inválida. Por favor, digite o número correspondente.");
+          }
+          break;
+
+      case "awaiting_problem_description":
+          // Lógica aprimorada para lidar com texto E/OU mídia (fotos)
+          if (msg.type === "chat") {
+              const messageText = msg.body.trim().toLowerCase();
+              
+              // Verifica se é um comando para finalizar o envio de fotos
+              if (messageText === "pronto" || messageText === "finalizar" || messageText === "concluir") {
+                  if (stateInfo.data.attachments && stateInfo.data.attachments.length > 0) {
+                      // Se já enviou fotos e agora está finalizando
+                      if (!stateInfo.data.problemDescription) {
+                          // Se ainda não tem descrição, pede para descrever o problema
+                          await client.sendMessage(senderId, "Entendi que você terminou de enviar fotos. Agora, por favor, descreva o problema ou serviço que você precisa em texto.");
+                          return;
+                      } else {
+                          // Se já tem descrição e fotos, avança para verificar disponibilidade
+                          stateInfo.state = "fetching_availability";
+                          console.log(`[ESTADO] Estado atualizado para fetching_availability para ${senderId} após finalizar fotos`);
+                          await client.sendMessage(senderId, `Obrigado pelas ${stateInfo.data.attachments.length} foto(s) e pela descrição. Vou verificar os horários disponíveis na agenda. Isso pode levar um momento...`);
+                          await fetchAndShowAvailability(senderId, stateInfo.data);
+                          return;
+                      }
+                  } else {
+                      // Tentou finalizar sem enviar fotos
+                      await client.sendMessage(senderId, "Você ainda não enviou nenhuma foto. Por favor, envie fotos do problema ou descreva o problema em texto.");
+                      return;
+                  }
+              }
+              
+              // Caso seja uma descrição normal em texto
+              stateInfo.data.problemDescription = messageText;
+              console.log(`[DADO] Descrição do problema recebida: ${stateInfo.data.problemDescription}`);
+              
+              // Se já tem fotos, pergunta se quer enviar mais ou avançar
+              if (stateInfo.data.attachments && stateInfo.data.attachments.length > 0) {
+                  await client.sendMessage(senderId, 
+                      `Descrição recebida! Você já enviou ${stateInfo.data.attachments.length} foto(s).\n\n` +
+                      `Você pode:\n` +
+                      `1. Enviar mais fotos\n` +
+                      `2. Digite "pronto" para avançar para a seleção de horários`
+                  );
+                  return;
+              } else {
+                  // Se não tem fotos, pergunta se quer enviar fotos
+                  stateInfo.state = "awaiting_photos_confirmation";
+                  console.log(`[ESTADO] Estado atualizado para awaiting_photos_confirmation para ${senderId}`);
+                  await client.sendMessage(senderId, 
+                      `Descrição recebida: "${stateInfo.data.problemDescription}".\n\n` +
+                      `Você gostaria de enviar fotos para ajudar no diagnóstico?\n` +
+                      `1. Sim, enviar fotos\n` +
+                      `2. Não, seguir para horários`
+                  );
+              }
+          } else if (msg.type === "image" || msg.type === "video") {
+              // Lidar com o recebimento de mídia
+              try {
+                  const media = await msg.downloadMedia();
+                  if (!media || !media.data) {
+                      await client.sendMessage(senderId, "Não foi possível processar esta mídia. Tente novamente.");
+                      return;
+                  }
+
+                  // Salvar mídia em um diretório temporário ou processar diretamente
+                  const uploadDir = path.join(__dirname, 'uploads');
+                  if (!fs.existsSync(uploadDir)) {
+                      fs.mkdirSync(uploadDir, { recursive: true });
+                  }
+                  const timestamp = new Date().getTime();
+                  const fileName = `${senderNumber}_${timestamp}.${media.mimetype.split('/')[1]}`;
+                  const filePath = path.join(uploadDir, fileName);
+                  
+                  // Salvar arquivo
+                  const fileData = media.data.replace(/^data:image\/\w+;base64,/, ''); // Remove prefixo se houver
+                  fs.writeFileSync(filePath, Buffer.from(fileData, 'base64'));
+                  console.log(`[MÍDIA] Mídia salva em: ${filePath}`);
+
+                  // Adicionar caminho do arquivo ao estado do usuário
+                  if (!stateInfo.data.attachments) {
+                      stateInfo.data.attachments = [];
+                  }
+                  stateInfo.data.attachments.push(filePath);
+                  
+                  const photoCount = stateInfo.data.attachments.length;
+                  await client.sendMessage(senderId, 
+                      `Foto #${photoCount} recebida!\n\n` +
+                      `Você pode enviar mais fotos ou, se já terminou, digite "pronto".\n` +
+                      `Se ainda não descreveu o problema, por favor, faça-o em texto.`
+                  );
+
+              } catch (error) {
+                  console.error("[ERRO MÍDIA] Falha ao processar mídia:", error);
+                  await client.sendMessage(senderId, "Ocorreu um erro ao processar a mídia. Tente novamente.");
+              }
+          } else {
+              await client.sendMessage(senderId, "Por favor, envie uma descrição em texto ou uma foto/vídeo do problema.");
+          }
+          break;
+
+      case "awaiting_photos_confirmation":
+          const photoConfirm = msg.body.trim();
+          if (photoConfirm === "1" || photoConfirm.toLowerCase() === "sim") {
+              stateInfo.state = "awaiting_problem_description"; // Volta para permitir envio de fotos
+              console.log(`[ESTADO] Estado atualizado para awaiting_problem_description (para fotos) para ${senderId}`);
+              await client.sendMessage(senderId, "Ok, pode enviar as fotos. Quando terminar, digite 

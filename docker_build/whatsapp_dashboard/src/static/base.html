@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Dashboard WhatsApp Bot{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #25D366;
+            --secondary-color: #128C7E;
+            --accent-color: #075E54;
+            --light-bg: #f8f9fa;
+            --border-radius: 4px;
+        }
+        
+        body {
+            background-color: var(--light-bg);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        .sidebar {
+            background: linear-gradient(135deg, var(--accent-color), var(--secondary-color));
+            min-height: 100vh;
+            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+        }
+        
+        .sidebar .nav-link {
+            color: rgba(255,255,255,0.8);
+            border-radius: var(--border-radius);
+            margin: 2px 0;
+            transition: all 0.3s ease;
+        }
+        
+        .sidebar .nav-link:hover,
+        .sidebar .nav-link.active {
+            background-color: rgba(255,255,255,0.1);
+            color: white;
+            transform: translateX(5px);
+        }
+        
+        .main-content {
+            padding: 20px;
+        }
+        
+        .card {
+            border: none;
+            border-radius: var(--border-radius);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            transition: transform 0.2s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+            border-radius: var(--border-radius);
+        }
+        
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+        
+        .table {
+            border-radius: var(--border-radius);
+            overflow: hidden;
+        }
+        
+        .alert {
+            border-radius: var(--border-radius);
+            border: none;
+        }
+        
+        .form-control, .form-select {
+            border-radius: var(--border-radius);
+            border: 1px solid #ddd;
+        }
+        
+        .form-control:focus, .form-select:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 0.2rem rgba(37, 211, 102, 0.25);
+        }
+        
+        .navbar-brand {
+            font-weight: bold;
+            color: var(--accent-color) !important;
+        }
+        
+        .status-badge {
+            font-size: 0.8em;
+            padding: 4px 8px;
+            border-radius: var(--border-radius);
+        }
+        
+        .stats-card {
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+        }
+        
+        .breadcrumb {
+            background-color: transparent;
+            padding: 0;
+        }
+        
+        .breadcrumb-item + .breadcrumb-item::before {
+            content: ">";
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <nav class="col-md-3 col-lg-2 d-md-block sidebar collapse">
+                <div class="position-sticky pt-3">
+                    <div class="text-center mb-4">
+                        <h5 class="text-white">
+                            <i class="fab fa-whatsapp me-2"></i>
+                            WhatsApp Bot
+                        </h5>
+                        {% if current_user %}
+                        <small class="text-white-50">{{ current_user.get_role_display() }}</small>
+                        {% endif %}
+                    </div>
+                    
+                    <ul class="nav flex-column">
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('dashboard.main') }}">
+                                <i class="fas fa-tachometer-alt me-2"></i>
+                                Dashboard
+                            </a>
+                        </li>
+                        
+                        {% if current_user and current_user.has_permission('view_clients') %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('clients.list') }}">
+                                <i class="fas fa-users me-2"></i>
+                                Clientes
+                            </a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if current_user and current_user.has_permission('view_orders') %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('service_orders.list') }}">
+                                <i class="fas fa-clipboard-list me-2"></i>
+                                Ordens de Serviço
+                            </a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if current_user and current_user.has_permission('view_all') %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('technicians.list') }}">
+                                <i class="fas fa-hard-hat me-2"></i>
+                                Técnicos
+                            </a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if current_user and current_user.has_permission('view_financial') %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('financial.main') }}">
+                                <i class="fas fa-dollar-sign me-2"></i>
+                                Financeiro
+                            </a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if current_user and current_user.has_permission('manage_users') %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('auth.users') }}">
+                                <i class="fas fa-user-cog me-2"></i>
+                                Usuários
+                            </a>
+                        </li>
+                        {% endif %}
+                    </ul>
+                    
+                    <hr class="text-white-50">
+                    
+                    <ul class="nav flex-column">
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('dashboard.profile') }}">
+                                <i class="fas fa-user me-2"></i>
+                                Perfil
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('auth.logout') }}">
+                                <i class="fas fa-sign-out-alt me-2"></i>
+                                Sair
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+            </nav>
+            
+            <!-- Main content -->
+            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
+                <!-- Header -->
+                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+                    <div>
+                        <h1 class="h2">{% block page_title %}Dashboard{% endblock %}</h1>
+                        {% block breadcrumb %}{% endblock %}
+                    </div>
+                    <div class="btn-toolbar mb-2 mb-md-0">
+                        {% block page_actions %}{% endblock %}
+                    </div>
+                </div>
+                
+                <!-- Flash messages -->
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                    {% if messages %}
+                        {% for category, message in messages %}
+                            <div class="alert alert-{{ 'danger' if category == 'error' else category }} alert-dismissible fade show" role="alert">
+                                {{ message }}
+                                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                            </div>
+                        {% endfor %}
+                    {% endif %}
+                {% endwith %}
+                
+                <!-- Page content -->
+                {% block content %}{% endblock %}
+            </main>
+        </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,38 @@
+version: '3'
+
+services:
+  whatsapp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kasbysuporttech/whatsapp-bot:latest
+    container_name: whatsapp-bot
+    restart: always
+    volumes:
+      - whatsapp-data:/usr/src/app/.wwebjs_auth
+      - whatsapp-cache:/usr/src/app/.wwebjs_cache
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=104.234.30.102
+      - DB_USER=root
+      - DB_PASSWORD=+0q)3E3.G]Yu
+      - DB_NAME=WTS2
+    networks:
+      - bot-network
+    # Configuração para iniciar automaticamente com o sistema
+    deploy:
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  whatsapp-data:
+    driver: local
+  whatsapp-cache:
+    driver: local

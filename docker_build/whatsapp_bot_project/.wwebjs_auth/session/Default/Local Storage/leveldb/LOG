@@ -1,0 +1,5 @@
+2025/06/06-06:22:38.198 390a Creating DB /home/ubuntu/whatsapp_bot_project/.wwebjs_auth/session/Default/Local Storage/leveldb since it was missing.
+2025/06/06-06:22:38.202 390a Reusing MANIFEST /home/ubuntu/whatsapp_bot_project/.wwebjs_auth/session/Default/Local Storage/leveldb/MANIFEST-000001
+2025/06/08-08:43:38.646 99c1 Level-0 table #5: started
+2025/06/08-08:43:38.647 99c1 Level-0 table #5: 17370 bytes OK
+2025/06/08-08:43:38.647 99c1 Delete type=0 #3
